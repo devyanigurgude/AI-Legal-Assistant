@@ -4,17 +4,23 @@ import { BarChart3 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 interface RiskChartProps {
-  high: number;
-  medium: number;
-  low: number;
+  chartData: Array<{
+    name: string;
+    value: number;
+  }>;
 }
 
-export default function RiskChart({ high, medium, low }: RiskChartProps) {
-  const data = [
-    { name: "High Risk", value: high, fill: "hsl(var(--destructive))" },
-    { name: "Medium Risk", value: medium, fill: "hsl(var(--risk-medium))" },
-    { name: "Low Risk", value: low, fill: "hsl(var(--risk-low))" },
-  ];
+export default function RiskChart({ chartData }: RiskChartProps) {
+  const data = chartData.map((entry) => {
+    const normalized = entry.name.toLowerCase();
+    let fill = "hsl(var(--accent))";
+
+    if (normalized.includes("high")) fill = "hsl(var(--destructive))";
+    else if (normalized.includes("medium")) fill = "hsl(var(--risk-medium))";
+    else if (normalized.includes("low")) fill = "hsl(var(--risk-low))";
+
+    return { ...entry, fill };
+  });
 
   return (
     <Card className="rounded-xl border bg-card shadow-sm hover:shadow-lg transition-all duration-200">

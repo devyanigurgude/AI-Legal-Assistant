@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React, { useEffect, useMemo } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { FileText, ShieldAlert, ShieldCheck, Shield, MessageSquare, BarChart3, AlertCircle } from "lucide-react";
 import { useNavigate } from "react-router-dom";
@@ -16,42 +16,75 @@ const features = [
   { label: "Reports", icon: BarChart3, path: "/dashboard/reports", desc: "Generate downloadable summaries" },
 ];
 
-const getRiskLevel = (contract: { analysis?: { risk_level?: string; risk_score?: number }; risk_classification?: string; risk_score?: number }) => {
-  const score = typeof contract.analysis?.risk_score === "number" ? contract.analysis.risk_score : typeof contract.risk_score === "number" ? contract.risk_score : undefined;
-
-  if (typeof score === "number") {
-    if (score > 0.7) return "high";
-    if (score > 0.4) return "medium";
-    return "low";
-  }
-
-  const raw = String(contract.analysis?.risk_level ?? contract.risk_classification ?? "").toLowerCase();
-  if (raw === "high" || raw === "medium" || raw === "low") return raw;
-  return "";
-};
-
 export default function OverviewPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const { contracts, loading, error, refreshContracts } = useContracts();
 
-  const highRiskCount = contracts.filter((contract) => getRiskLevel(contract) === "high").length;
-  const mediumRiskCount = contracts.filter((contract) => getRiskLevel(contract) === "medium").length;
-  const lowRiskCount = contracts.filter((contract) => getRiskLevel(contract) === "low").length;
+  const riskCounts = useMemo(() => {
+    return contracts.reduce(
+      (acc, contract) => {
+        const c = contract as {
+          risk_score?: number | string;
+          riskScore?: number | string;
+          analysis?: {
+            risk_score?: number | string;
+            riskScore?: number | string;
+          };
+        };
+
+        const score = c.risk_score ?? c.riskScore ?? c.analysis?.risk_score ?? c.analysis?.riskScore ?? null;
+
+        if (score === null || score === undefined) return acc;
+
+        const numericScore = Number(score);
+        if (Number.isNaN(numericScore)) return acc;
+
+        if (numericScore > 0.7) acc.high += 1;
+        else if (numericScore > 0.4) acc.medium += 1;
+        else acc.low += 1;
+
+        return acc;
+      },
+      { high: 0, medium: 0, low: 0 }
+    );
+  }, [contracts]);
+
+  const highRisk = riskCounts.high;
+  const mediumRisk = riskCounts.medium;
+  const lowRisk = riskCounts.low;
+
+  const chartData = useMemo(
+    () => [
+      { name: "High Risk", value: highRisk },
+      { name: "Medium Risk", value: mediumRisk },
+      { name: "Low Risk", value: lowRisk },
+    ],
+    [highRisk, mediumRisk, lowRisk]
+  );
 
   useEffect(() => {
     if (contracts.length === 0) return;
 
     const hasRiskData = contracts.some((contract) => {
-      const hasScore =
-        typeof contract.analysis?.risk_score === "number" ||
-        typeof (contract as { risk_score?: number }).risk_score === "number";
-      const hasRiskLabel = Boolean(contract.analysis?.risk_level ?? contract.risk_classification);
-      return hasScore || hasRiskLabel;
+      const c = contract as {
+        risk_score?: number | string;
+        riskScore?: number | string;
+        analysis?: {
+          risk_score?: number | string;
+          riskScore?: number | string;
+        };
+      };
+      return (
+        c.risk_score !== undefined ||
+        c.riskScore !== undefined ||
+        c.analysis?.risk_score !== undefined ||
+        c.analysis?.riskScore !== undefined
+      );
     });
 
     if (!hasRiskData) {
-      console.log("Dashboard risk data missing. Contract object sample:", contracts[0]);
+      console.log("Contracts data:", contracts);
     }
   }, [contracts]);
 
@@ -76,9 +109,9 @@ export default function OverviewPage() {
 
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <StatsCard label="Total Contracts" value={contracts.length} icon={FileText} />
-        <StatsCard label="High Risk Contracts" value={highRiskCount} icon={ShieldAlert} toneClass="bg-destructive/10" />
-        <StatsCard label="Medium Risk Contracts" value={mediumRiskCount} icon={Shield} toneClass="bg-risk-medium/15" />
-        <StatsCard label="Low Risk Contracts" value={lowRiskCount} icon={ShieldCheck} toneClass="bg-risk-low/15" />
+        <StatsCard label="High Risk Contracts" value={highRisk} icon={ShieldAlert} toneClass="bg-destructive/10" />
+        <StatsCard label="Medium Risk Contracts" value={mediumRisk} icon={Shield} toneClass="bg-risk-medium/15" />
+        <StatsCard label="Low Risk Contracts" value={lowRisk} icon={ShieldCheck} toneClass="bg-risk-low/15" />
       </section>
 
       <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
@@ -112,7 +145,7 @@ export default function OverviewPage() {
           )}
         </div>
         <div>
-          <RiskChart high={highRiskCount} medium={mediumRiskCount} low={lowRiskCount} />
+          <RiskChart chartData={chartData} />
         </div>
       </section>
     </div>
