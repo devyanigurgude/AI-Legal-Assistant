@@ -14,6 +14,11 @@ class AuthRequest(BaseModel):
     password: str
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
 @router.post("/register")
 def register(data: AuthRequest, db: Session = Depends(get_db)):
     existing_user = db.query(User).filter(User.username == data.username).first()
@@ -33,10 +38,14 @@ def register(data: AuthRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/login")
-def login(data: AuthRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == data.username).first()
+def login(login_data: LoginRequest, db: Session = Depends(get_db)):
+    username = login_data.username.strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
 
-    if not user or not verify_password(data.password, user.password_hash):
+    user = db.query(User).filter(User.username == username).first()
+
+    if not user or not verify_password(login_data.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token(user.id)

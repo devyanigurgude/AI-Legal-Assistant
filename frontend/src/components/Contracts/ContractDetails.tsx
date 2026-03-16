@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { analyzeContract, getContract, normalizeContractAnalysis } from "@/services/apiService";
+import { getContract, normalizeContractAnalysis, runContractAnalysis } from "@/services/apiService";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Loader2, RefreshCw, FileSearch } from "lucide-react";
@@ -35,7 +35,7 @@ export default function ContractDetails({ contractId }: Props) {
         ((typeof stored?.summary === "string" && stored.summary.trim().length > 0) ||
           (Array.isArray(stored?.clauses) && stored.clauses.length > 0) ||
           (typeof stored?.risk_score === "number" && stored.risk_score > 0));
-      setAnalysis(hasMeaningfulStoredAnalysis ? normalizeContractAnalysis(data) : null);
+      setAnalysis(hasMeaningfulStoredAnalysis ? normalizeContractAnalysis(data) as typeof analysis : null);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to fetch contract analysis.";
       setAnalysis(null);
@@ -49,8 +49,11 @@ export default function ContractDetails({ contractId }: Props) {
     setAnalyzing(true);
     setError("");
     try {
-      const data = await analyzeContract(contractId, "full_contract_analysis");
-      setAnalysis(normalizeContractAnalysis(data));
+      const data = await runContractAnalysis(contractId);
+      const normalized = normalizeContractAnalysis(data);
+      if (normalized.risk_level === "high" || normalized.risk_level === "low" || normalized.risk_level === "medium") {
+        setAnalysis(normalized as typeof analysis);
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Analysis failed";
       setError(message);
@@ -78,7 +81,7 @@ export default function ContractDetails({ contractId }: Props) {
           <FileSearch className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
           <p className="text-muted-foreground mb-4">No analysis available for this contract</p>
           {error && <p className="text-sm text-destructive mb-4">{error}</p>}
-          <Button onClick={handleAnalyze} disabled={analyzing}>
+          <Button type="button" onClick={handleAnalyze} disabled={analyzing}>
             {analyzing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
             Run Analysis
           </Button>
@@ -91,7 +94,7 @@ export default function ContractDetails({ contractId }: Props) {
     <div className="space-y-6 animate-fade-in">
       <div className="flex items-center justify-between">
         <h2 className="font-display text-xl">Contract Analysis</h2>
-        <Button variant="outline" size="sm" onClick={handleAnalyze} disabled={analyzing}>
+        <Button type="button" variant="outline" size="sm" onClick={handleAnalyze} disabled={analyzing}>
           {analyzing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
           Re-analyze
         </Button>

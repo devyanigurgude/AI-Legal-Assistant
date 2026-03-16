@@ -8,11 +8,13 @@ import shutil
 import os
 import json
 import re
+import logging
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
 from google import genai  # Gemini client
 from google.genai import types
+from google.genai import errors as genai_errors
 import faiss
 import numpy as np
 from auth import router as auth_router
@@ -27,6 +29,7 @@ from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer
 from pydantic import BaseModel
 from typing import List
 app = FastAPI()
+logger = logging.getLogger("contract-ai")
 
 allowed_origins = [
     "http://localhost:8080",
@@ -79,6 +82,149 @@ CHAT_MEMORY: dict[str, list[dict[str, str]]] = {}
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
+def _is_quota_or_rate_error(exc: Exception) -> bool:
+    if isinstance(exc, genai_errors.ClientError):
+        status = str(getattr(exc, "status_code", ""))
+        message = str(exc).lower()
+        return status == "429" or "resource_exhausted" in message or "quota" in message or "rate" in message
+    msg = str(exc).lower()
+    return "resource_exhausted" in msg or "quota" in msg or "rate limit" in msg or "429" in msg
+
+
+def _safe_generate_content(prompt: str, *, temperature: float = 0.1) -> str:
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=temperature),
+        )
+        return str(response.text or "").strip()
+    except Exception as exc:
+        if _is_quota_or_rate_error(exc):
+            logger.warning("Gemini quota/rate limit reached: %s", exc)
+        else:
+            logger.exception("Gemini generate_content failed")
+        return ""
+
+
+def _safe_embed_contents(contents: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray | None:
+    if not contents:
+        return np.empty((0, index.d), dtype=np.float32)
+    try:
+        embed_resp = client.models.embed_content(
+            model="gemini-embedding-001",
+            contents=contents,
+            config=types.EmbedContentConfig(
+                task_type=task_type,
+                output_dimensionality=index.d,
+            ),
+        )
+        return np.asarray(
+            [np.asarray(e.values, dtype=np.float32) for e in embed_resp.embeddings],
+            dtype=np.float32,
+        )
+    except Exception as exc:
+        if _is_quota_or_rate_error(exc):
+            logger.warning("Gemini embedding quota/rate limit reached: %s", exc)
+        else:
+            logger.exception("Gemini embed_content failed")
+        return None
+
+
+def _fallback_summary(text: str, max_len: int = 500) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return "No contract text available for summary."
+    sentence_split = re.split(r"(?<=[.!?])\s+", cleaned)
+    summary = " ".join(sentence_split[:3]).strip() or cleaned[:max_len].strip()
+    return summary[:max_len]
+
+
+def _heuristic_clause_items(text: str, max_items: int = 8) -> list[dict]:
+    lines = [ln.strip() for ln in re.split(r"[\n\r]+", text or "") if ln.strip()]
+    long_lines = [ln for ln in lines if len(ln.split()) >= 8]
+    chunks = long_lines[:max_items]
+    if not chunks:
+        paragraph_split = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text or "") if p.strip()]
+        chunks = paragraph_split[:max_items]
+
+    patterns = [
+        ("Termination", ["terminate", "termination", "breach", "notice"]),
+        ("Payment", ["payment", "invoice", "fee", "penalty", "late"]),
+        ("Confidentiality", ["confidential", "nda", "disclosure"]),
+        ("Liability", ["liability", "damages", "indemn", "warranty"]),
+        ("Data Protection", ["data", "privacy", "gdpr", "security"]),
+        ("IP Ownership", ["intellectual property", "ip", "ownership", "license"]),
+    ]
+    high_terms = {"unlimited", "sole discretion", "immediately", "without notice", "indemnify"}
+    medium_terms = {"penalty", "late fee", "automatic renewal", "exclusive", "liability"}
+
+    results: list[dict] = []
+    for idx, chunk in enumerate(chunks):
+        lower = chunk.lower()
+        ctype = "General"
+        for label, keys in patterns:
+            if any(k in lower for k in keys):
+                ctype = label
+                break
+        if any(t in lower for t in high_terms):
+            risk = "high"
+        elif any(t in lower for t in medium_terms):
+            risk = "medium"
+        else:
+            risk = "low"
+        results.append(
+            {
+                "id": f"clause-{idx + 1}",
+                "type": ctype,
+                "risk_level": risk,
+                "text": chunk[:500],
+            }
+        )
+    return results
+
+
+def _fallback_analysis_payload(text: str, existing_summary: str = "") -> dict:
+    lower = (text or "").lower()
+    high_markers = sum(lower.count(k) for k in ["unlimited liability", "indemnify", "without notice", "immediate termination"])
+    medium_markers = sum(lower.count(k) for k in ["penalty", "late fee", "automatic renewal", "exclusive", "governing law"])
+    risk_score = max(5, min(95, 20 + high_markers * 18 + medium_markers * 7))
+    risk_level = "high" if risk_score >= 70 else "medium" if risk_score >= 40 else "low"
+    summary = existing_summary.strip() or _fallback_summary(text)
+    clauses = _heuristic_clause_items(text)
+    return _normalize_analysis_payload(
+        {
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "summary": summary,
+            "clauses": clauses,
+        }
+    )
+
+
+def _fallback_risk_classification(text: str) -> str:
+    analysis = _fallback_analysis_payload(text)
+    lines = []
+    for clause in analysis.get("clauses", [])[:8]:
+        if not isinstance(clause, dict):
+            continue
+        lines.append(f"- {str(clause.get('type') or 'General')}: {str(clause.get('risk_level') or 'low').title()}")
+    return "\n".join(lines) if lines else "- General: Low"
+
+
+def _fallback_improvements(text: str) -> str:
+    base = [
+        "- Add clear termination notice periods and cure windows.",
+        "- Define liability caps and indemnity boundaries explicitly.",
+        "- Clarify payment terms, due dates, and dispute timelines.",
+        "- Add explicit confidentiality scope and survival period.",
+        "- Include governing law and dispute resolution details.",
+    ]
+    if not (text or "").strip():
+        return "\n".join(base[:3])
+    return "\n".join(base)
+
+
 def classify_risk(text: str) -> str:
     prompt = f"""
     You are a legal AI assistant.
@@ -89,12 +235,8 @@ def classify_risk(text: str) -> str:
     Contract Text:
     {text}
     """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.1)
-    )
-    return response.text
+    response_text = _safe_generate_content(prompt, temperature=0.1)
+    return response_text or _fallback_risk_classification(text)
 
 
 def suggest_improvements(text: str) -> str:
@@ -108,12 +250,8 @@ def suggest_improvements(text: str) -> str:
     Contract Text:
     {text}
     """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.1)
-    )
-    return response.text
+    response_text = _safe_generate_content(prompt, temperature=0.1)
+    return response_text or _fallback_improvements(text)
 
 
 def _extract_json_object(raw: str) -> dict:
@@ -320,14 +458,8 @@ def generate_contract_summary(text: str) -> str:
 
     {text}
     """
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.1
-        )
-    )
-    return response.text
+    response_text = _safe_generate_content(prompt, temperature=0.1)
+    return response_text or _fallback_summary(text)
 def chunk_text(text, chunk_size=500):
     """
     Splits text into chunks of ~chunk_size words each.
@@ -372,37 +504,18 @@ def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db),curr
     print(f"Total chunks created: {len(chunks)}")
     
      # 5️⃣ Generate embeddings using current Gemini SDK
-    embeddings = []
-    embed_resp = client.models.embed_content(
-    model="gemini-embedding-001",
-    contents=chunks,  # list of text chunks
-    config=types.EmbedContentConfig(
-        task_type="RETRIEVAL_DOCUMENT",
-        output_dimensionality=index.d,  # matches FAISS
-    ),
-)
-
-    # Convert embeddings to numpy array for FAISS
-    embeddings_np = np.asarray(
-    [np.asarray(e.values, dtype=np.float32) for e in embed_resp.embeddings],
-    dtype=np.float32,
-)
-
-    # Map vectors to metadata
-    vector_to_metadata.extend(
-    {"contract_id": contract_id, "chunk_text": chunk}
-    for chunk in chunks
-)
-
-    # 6️⃣ Add embeddings to FAISS index
-    index.add(embeddings_np)
-    vector_to_metadata.extend(
-    {"contract_id": contract_id, "chunk_text": chunk}
-    for chunk in chunks  # one metadata per chunk
-)
-    print("Number of chunks added:", len(chunks))
-    print("Number of embeddings:", len(embeddings_np))
-    print("FAISS index size now:", index.ntotal)
+    embeddings_np = _safe_embed_contents(chunks, task_type="RETRIEVAL_DOCUMENT")
+    if embeddings_np is not None and len(embeddings_np) > 0:
+        vector_to_metadata.extend(
+            {"contract_id": contract_id, "chunk_text": chunk}
+            for chunk in chunks
+        )
+        index.add(embeddings_np)
+        print("Number of chunks added:", len(chunks))
+        print("Number of embeddings:", len(embeddings_np))
+        print("FAISS index size now:", index.ntotal)
+    else:
+        logger.warning("Skipping embeddings for contract_id=%s due to embed failure", contract_id)
 
     
     # If text is large, trim or chunk (Gemini free tier safe)
@@ -410,17 +523,6 @@ def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db),curr
 
     # Generate AI summary using Gemini
     ai_summary = generate_contract_summary(trimmed_text)
- 
-    ai_summary_prompt = f"""
-    You are a legal assistant that summarizes contracts clearly.
-    Summarize this contract:
-    {trimmed_text}
-    """
-    ai_summary = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=ai_summary_prompt,
-        config=types.GenerateContentConfig(temperature=0.1)
-    ).text
 
     # 6️⃣ Generate Risk Classification & Suggested Improvements (Phase 3.2)
     ai_risk_analysis = classify_risk(trimmed_text)
@@ -466,16 +568,10 @@ from auth_utils import get_current_user
 
 
 def _search_relevant_chunks(user_query: str, top_k: int, contract_id: str | None = None):
-    embed_resp = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=[user_query],
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_DOCUMENT",
-            output_dimensionality=index.d
-        ),
-    )
-
-    query_vector = np.array(embed_resp.embeddings[0].values, dtype=np.float32).reshape(1, -1)
+    embedding = _safe_embed_contents([user_query], task_type="RETRIEVAL_DOCUMENT")
+    if embedding is None or len(embedding) == 0:
+        return []
+    query_vector = np.array(embedding[0], dtype=np.float32).reshape(1, -1)
     distances, indices = index.search(query_vector, max(top_k * 4, top_k))
 
     results = []
@@ -497,6 +593,44 @@ def _search_relevant_chunks(user_query: str, top_k: int, contract_id: str | None
         )
         if len(results) >= top_k:
             break
+    return results
+
+
+def _simple_search_chunks(text: str, user_query: str, contract_id: str | None, top_k: int) -> list[dict]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return []
+
+    # Split into paragraphs/sentences for lightweight fallback retrieval.
+    candidates = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n{2,}", cleaned) if p.strip()]
+    if not candidates:
+        return []
+
+    terms = [t for t in re.findall(r"[a-zA-Z0-9']+", (user_query or "").lower()) if len(t) > 2]
+    if not terms:
+        terms = [t for t in re.findall(r"[a-zA-Z0-9']+", cleaned.lower())[:5] if t]
+
+    scored: list[tuple[int, str]] = []
+    for chunk in candidates:
+        lower = chunk.lower()
+        score = sum(lower.count(t) for t in terms)
+        if score > 0:
+            scored.append((score, chunk))
+
+    if not scored:
+        # Fallback to first few chunks if no term matches.
+        scored = [(1, c) for c in candidates[:top_k]]
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results: list[dict] = []
+    for idx, (_, chunk) in enumerate(scored[:top_k]):
+        results.append(
+            {
+                "contract_id": contract_id,
+                "chunk_text": chunk[:1200],
+                "score": float(top_k - idx),
+            }
+        )
     return results
 
 
@@ -526,11 +660,12 @@ def _build_ai_answer(user_query: str, results: list[dict], memory_lines: list[st
     {top_chunks_text}
     """
 
-    return client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.1)
-    ).text
+    response_text = _safe_generate_content(prompt, temperature=0.1)
+    if response_text:
+        return response_text
+    if results:
+        return "I could not generate an AI answer right now. Based on retrieved clauses, please review highlighted sections and try again later."
+    return "I could not find enough indexed context for this question right now. Please retry after analysis or ask a narrower question."
 
 def _smalltalk_response(user_query: str) -> str | None:
     q = (user_query or "").strip().lower()
@@ -615,7 +750,11 @@ def query_contracts(request: QueryRequest, current_user: User = Depends(get_curr
 
 
 @app.post("/query/v2")
-def query_contracts_v2(request: QueryV2Request, current_user: User = Depends(get_current_user)):
+def query_contracts_v2(
+    request: QueryV2Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     user_query = request.query
     top_k = request.top_k
     contract_id = request.contract_id
@@ -648,6 +787,14 @@ def query_contracts_v2(request: QueryV2Request, current_user: User = Depends(get
         return response
 
     results = _search_relevant_chunks(user_query, top_k, contract_id=contract_id)
+    if not results:
+        contract = db.query(Contract).filter(Contract.id == contract_id).first()
+        results = _simple_search_chunks(
+            contract.text if contract else "",
+            user_query,
+            contract_id,
+            top_k,
+        )
 
     memory_lines = []
     if ENABLE_CHAT_MEMORY:
@@ -776,19 +923,13 @@ Contract text:
 {contract_text[:12000]}
 """
 
-    raw_text = ""
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.1),
-        )
-        raw_text = response.text or ""
-    except Exception:
-        raw_text = ""
+    raw_text = _safe_generate_content(prompt, temperature=0.1)
 
     payload = _extract_json_object(raw_text)
-    normalized = _normalize_analysis_payload(payload)
+    if payload:
+        normalized = _normalize_analysis_payload(payload)
+    else:
+        normalized = _fallback_analysis_payload(contract_text, str(contract.summary or ""))
 
     if not normalized["summary"]:
         normalized["summary"] = str(contract.summary or "").strip()
@@ -876,21 +1017,29 @@ async def explain_clause(data: ClauseExplainRequest):
     Do not include anything outside JSON.
     """
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt
-    )
-
-    raw_text = response.text or ""
+    raw_text = _safe_generate_content(prompt, temperature=0.1)
     parsed = _extract_json_object(raw_text)
 
     if not parsed:
+        simple = _fallback_summary(data.clause_text, max_len=260)
+        level = str(data.risk_level or "medium").strip().lower()
+        risk_reason = (
+            "This clause may expose one side to high obligations or weak safeguards."
+            if level == "high"
+            else "This clause has moderate ambiguity or obligations that should be clarified."
+            if level == "medium"
+            else "This clause appears lower risk but should still be reviewed for clarity."
+        )
         return {
-            "simple_explanation": raw_text.strip() or "Could not parse structured explanation.",
-            "example": "Could not structure example.",
-            "risk_reason": "Parsing error.",
-            "suggestions": ["Review manually."],
-            "complexity_level": "Medium"
+            "simple_explanation": simple or "Could not parse structured explanation.",
+            "example": f"For example, define exact duties and timelines for {data.clause_type or 'this clause'}.",
+            "risk_reason": risk_reason,
+            "suggestions": [
+                "Define obligations and timelines in explicit language.",
+                "Add limits, exceptions, and dispute handling terms.",
+                "Review manually with legal counsel for final wording.",
+            ],
+            "complexity_level": "High" if level == "high" else "Medium"
         }
 
     suggestions_raw = parsed.get("suggestions")
@@ -904,3 +1053,4 @@ async def explain_clause(data: ClauseExplainRequest):
         "suggestions": suggestions,
         "complexity_level": str(parsed.get("complexity_level") or "Medium").strip() or "Medium",
     }
+

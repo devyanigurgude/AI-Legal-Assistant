@@ -24,8 +24,9 @@ const formatUploadedAt = (value?: string) => {
 const getRiskLabel = (contract: Contract) => {
   const score = typeof contract.analysis?.risk_score === "number" ? contract.analysis.risk_score : undefined;
   if (typeof score === "number") {
-    if (score > 0.7) return "high";
-    if (score > 0.4) return "medium";
+    const normalizedScore = score > 1 ? score / 100 : score;
+    if (normalizedScore > 0.7) return "high";
+    if (normalizedScore > 0.4) return "medium";
     return "low";
   }
 

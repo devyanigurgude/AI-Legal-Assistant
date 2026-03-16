@@ -128,6 +128,19 @@ export const analyzeContract = async (contractId: string, query: string) => {
   return res.json(); // { ai_answer: "text", results: [...] }
 };
 
+export const runContractAnalysis = async (contractId: string) => {
+  const res = await fetch(`${API_BASE}/contracts/${contractId}/analyze`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseError(res, "Failed to run contract analysis"));
+  }
+
+  return res.json();
+};
+
 export const queryContractV2 = async (
   contractId: string,
   query: string,

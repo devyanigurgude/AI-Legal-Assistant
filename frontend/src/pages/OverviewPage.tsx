@@ -1,13 +1,15 @@
-import React, { useEffect, useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { FileText, ShieldAlert, ShieldCheck, Shield, MessageSquare, BarChart3, AlertCircle } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { useContracts } from "@/hooks/useContracts";
+import { getContract } from "@/services/apiService";
 import StatsCard from "@/components/dashboard/StatsCard";
 import RecentContracts from "@/components/dashboard/RecentContracts";
 import RiskChart from "@/components/dashboard/RiskChart";
 import { Button } from "@/components/ui/button";
+import type { Contract } from "@/types/api";
 
 const features = [
   { label: "Contracts", icon: FileText, path: "/dashboard/contracts", desc: "Upload & manage agreements" },
@@ -20,9 +22,54 @@ export default function OverviewPage() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const { contracts, loading, error, refreshContracts } = useContracts();
+  const [enrichedContracts, setEnrichedContracts] = useState<Contract[]>([]);
+  const [enrichLoading, setEnrichLoading] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    const enrich = async () => {
+      if (contracts.length === 0) {
+        if (active) setEnrichedContracts([]);
+        return;
+      }
+
+      setEnrichLoading(true);
+
+      const detailed = await Promise.all(
+        contracts.map(async (contract) => {
+          try {
+            const full = await getContract(contract.id);
+            const fullAnalysis =
+              full && typeof full === "object" && full.analysis && typeof full.analysis === "object"
+                ? (full.analysis as Contract["analysis"])
+                : contract.analysis;
+
+            return {
+              ...contract,
+              analysis: fullAnalysis,
+            } as Contract;
+          } catch {
+            return contract;
+          }
+        })
+      );
+
+      if (active) {
+        setEnrichedContracts(detailed);
+        setEnrichLoading(false);
+      }
+    };
+
+    enrich();
+
+    return () => {
+      active = false;
+    };
+  }, [contracts]);
 
   const riskCounts = useMemo(() => {
-    return contracts.reduce(
+    return enrichedContracts.reduce(
       (acc, contract) => {
         const c = contract as {
           risk_score?: number | string;
@@ -39,16 +86,17 @@ export default function OverviewPage() {
 
         const numericScore = Number(score);
         if (Number.isNaN(numericScore)) return acc;
+        const normalizedScore = numericScore > 1 ? numericScore / 100 : numericScore;
 
-        if (numericScore > 0.7) acc.high += 1;
-        else if (numericScore > 0.4) acc.medium += 1;
+        if (normalizedScore > 0.7) acc.high += 1;
+        else if (normalizedScore > 0.4) acc.medium += 1;
         else acc.low += 1;
 
         return acc;
       },
       { high: 0, medium: 0, low: 0 }
     );
-  }, [contracts]);
+  }, [enrichedContracts]);
 
   const highRisk = riskCounts.high;
   const mediumRisk = riskCounts.medium;
@@ -64,9 +112,9 @@ export default function OverviewPage() {
   );
 
   useEffect(() => {
-    if (contracts.length === 0) return;
+    if (enrichedContracts.length === 0) return;
 
-    const hasRiskData = contracts.some((contract) => {
+    const hasRiskData = enrichedContracts.some((contract) => {
       const c = contract as {
         risk_score?: number | string;
         riskScore?: number | string;
@@ -84,9 +132,9 @@ export default function OverviewPage() {
     });
 
     if (!hasRiskData) {
-      console.log("Contracts data:", contracts);
+      console.log("Contracts data:", enrichedContracts);
     }
-  }, [contracts]);
+  }, [enrichedContracts]);
 
   return (
     <div className="animate-fade-in space-y-8">
@@ -136,12 +184,12 @@ export default function OverviewPage() {
 
       <section className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2">
-          {loading ? (
+          {loading || enrichLoading ? (
             <Card className="rounded-xl border bg-card">
               <CardContent className="p-6 text-sm text-muted-foreground">Loading recent contracts...</CardContent>
             </Card>
           ) : (
-            <RecentContracts contracts={contracts} />
+            <RecentContracts contracts={enrichedContracts} />
           )}
         </div>
         <div>
