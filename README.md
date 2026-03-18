@@ -1,8 +1,5 @@
 # AI Legal Assistant
 
-[![CI](https://github.com/devyanigurgude/AI-Legal-Assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/devyanigurgude/AI-Legal-Assistant/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 AI Legal Assistant is a full‑stack web app that helps analyze contract PDFs with AI‑powered summaries, risk signals, and clause insights. The backend is a FastAPI service with a Postgres database, and the frontend is a React + Vite dashboard.
 
 **Key Features**
