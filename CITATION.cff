@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+title: "AI Legal Assistant"
+message: "If you use this project in academic work, please cite it as below."
+type: software
+authors:
+  - family-names: "Gurgude"
+    given-names: "Devyani"
+version: 0.1.0
+date-released: 2026-03-18
+url: "https://github.com/devyanigurgude/AI-Legal-Assistant"

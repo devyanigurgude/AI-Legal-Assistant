@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+psycopg2-binary
+alembic
+python-dotenv
+python-multipart
+pydantic
+PyPDF2
+reportlab
+numpy
+faiss-cpu
+google-genai
+click
+passlib[bcrypt]
+python-jose
