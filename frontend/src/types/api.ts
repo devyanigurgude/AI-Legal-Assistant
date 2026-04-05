@@ -43,9 +43,13 @@ export interface RagChunk {
 }
 
 export interface RagMessage {
+  id?: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  contract_id?: string;
+  user_id?: string;
+  created_at?: string;
   chunks?: RagChunk[];
 }
 

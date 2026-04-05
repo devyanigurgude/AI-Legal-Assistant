@@ -42,6 +42,15 @@ export const loginUser = async (username: string, password: string) => {
   return data;
 };
 
+export const getMe = async () => {
+  const res = await fetch(`${API_BASE}/auth/me`, {
+    headers: authHeaders(),
+  });
+
+  if (!res.ok) throw new Error(await parseError(res, "Failed to load user"));
+  return res.json();
+};
+
 // ================= CONTRACTS =================
 
 export const uploadContract = async (file: File) => {
@@ -79,6 +88,26 @@ export const getContract = async (contractId: string) => {
 
 const asRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+
+const normalizeChatMessage = (value: unknown) => {
+  const record = asRecord(value);
+  const createdAt =
+    typeof record.created_at === "string"
+      ? record.created_at
+      : typeof record.timestamp === "string"
+      ? record.timestamp
+      : new Date().toISOString();
+
+  return {
+    id: typeof record.id === "string" ? record.id : undefined,
+    contract_id: typeof record.contract_id === "string" ? record.contract_id : undefined,
+    user_id: typeof record.user_id === "string" ? record.user_id : undefined,
+    role: record.role === "assistant" ? "assistant" : "user",
+    content: typeof record.content === "string" ? record.content : "",
+    created_at: createdAt,
+    timestamp: createdAt,
+  } as const;
+};
 
 export const normalizeContractAnalysis = (data: unknown) => {
   const root = asRecord(data);
@@ -164,6 +193,36 @@ export const queryContractV2 = async (
   const data = await res.json();
   if (!res.ok) throw new Error(data.detail || "Chat query failed");
   return data;
+};
+
+export const getChatMessages = async (contractId: string) => {
+  const res = await fetch(`${API_BASE}/chat/${contractId}/messages`, {
+    headers: authHeaders(),
+  });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Failed to load chat history");
+
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  return messages.map(normalizeChatMessage);
+};
+
+export const saveChatMessage = async (
+  contractId: string,
+  payload: { role: "user" | "assistant"; content: string }
+) => {
+  const res = await fetch(`${API_BASE}/chat/${contractId}/messages`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(),
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || "Failed to save chat message");
+  return normalizeChatMessage(data);
 };
 
 export const deleteContract = async (contractId: string) => {

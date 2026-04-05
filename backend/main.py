@@ -1,13 +1,15 @@
 from click import prompt
 from PyPDF2 import PdfReader
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Response
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 from database import engine, SessionLocal
-from models import Base, Contract, User
+from models import Base, Contract, User, ChatMessage
 import shutil
 import os
 import json
 import re
+import hashlib
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -134,7 +136,7 @@ def _safe_embed_contents(contents: list[str], *, task_type: str = "RETRIEVAL_DOC
 def _fallback_summary(text: str, max_len: int = 500) -> str:
     cleaned = re.sub(r"\s+", " ", (text or "")).strip()
     if not cleaned:
-        return "No contract text available for summary."
+        return "No contract text is available, so a simple summary cannot be created yet."
     sentence_split = re.split(r"(?<=[.!?])\s+", cleaned)
     summary = " ".join(sentence_split[:3]).strip() or cleaned[:max_len].strip()
     return summary[:max_len]
@@ -208,29 +210,96 @@ def _fallback_risk_classification(text: str) -> str:
     for clause in analysis.get("clauses", [])[:8]:
         if not isinstance(clause, dict):
             continue
-        lines.append(f"- {str(clause.get('type') or 'General')}: {str(clause.get('risk_level') or 'low').title()}")
-    return "\n".join(lines) if lines else "- General: Low"
+        clause_type = str(clause.get("type") or "General")
+        clause_risk = str(clause.get("risk_level") or "low").title()
+        caution = (
+            "This part may create a bigger burden or weaker protection."
+            if clause_risk == "High"
+            else "This part should be checked carefully because it may cause problems later."
+            if clause_risk == "Medium"
+            else "This part looks safer, but it should still be read carefully."
+        )
+        lines.append(f"- {clause_type}: {clause_risk} risk. {caution}")
+    return "\n".join(lines) if lines else "- General: Low risk. No major warning signs were found in the available text."
 
 
 def _fallback_improvements(text: str) -> str:
     base = [
-        "- Add clear termination notice periods and cure windows.",
-        "- Define liability caps and indemnity boundaries explicitly.",
-        "- Clarify payment terms, due dates, and dispute timelines.",
-        "- Add explicit confidentiality scope and survival period.",
-        "- Include governing law and dispute resolution details.",
+        "- State clearly when either side can end the contract and how much notice must be given.",
+        "- Put a clear limit on liability so one side is not exposed to unlimited losses.",
+        "- Explain payment amounts, due dates, and what happens if there is a delay or dispute.",
+        "- Say exactly what information must stay private and how long that duty continues.",
+        "- Add clear rules for which law applies and how disputes will be handled.",
     ]
     if not (text or "").strip():
         return "\n".join(base[:3])
     return "\n".join(base)
 
 
+def _clean_contract_snippet(text: str, max_len: int = 260) -> str:
+    cleaned = (text or "").replace("\r", " ").replace("\n", " ")
+    cleaned = (
+        cleaned.replace("ﬁ", "fi")
+        .replace("ﬂ", "fl")
+        .replace("’", "'")
+        .replace("“", '"')
+        .replace("”", '"')
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_len]
+
+
+def _fallback_clause_explanation(clause_text: str, clause_type: str, risk_level: str) -> dict:
+    clause_label = (clause_type or "contract").strip() or "contract"
+    level = str(risk_level or "medium").strip().lower()
+    snippet = _clean_contract_snippet(clause_text, max_len=180)
+
+    type_templates = {
+        "termination": "This clause explains when the agreement can end and what each side must do before ending it.",
+        "payment": "This clause explains when money must be paid, how much is due, and what may happen if payment is late.",
+        "confidentiality": "This clause explains what information must stay private and when it can or cannot be shared.",
+        "liability": "This clause explains who may be responsible if something goes wrong and how much they may have to cover.",
+        "data protection": "This clause explains how personal or sensitive data must be handled and protected.",
+        "ip ownership": "This clause explains who owns the work, ideas, or materials covered by the agreement.",
+        "general": "This clause sets an important rule in the agreement that both sides should understand clearly.",
+    }
+
+    simple = type_templates.get(clause_label.lower(), f"This {clause_label.lower()} clause sets an important rule in the agreement that both sides should understand clearly.")
+    if snippet:
+        simple = f"{simple} It appears to cover this point: \"{snippet}\"."
+
+    risk_reason = (
+        "This clause may place a heavy burden on one side or leave that side with weak protection."
+        if level == "high"
+        else "This clause should be checked carefully because unclear wording could cause disagreement or extra obligations later."
+        if level == "medium"
+        else "This clause looks lower risk, but the wording should still be clear so both sides understand it the same way."
+    )
+
+    return {
+        "simple_explanation": simple,
+        "example": f"For example, this {clause_label.lower()} clause should clearly say who must do what, when they must do it, and what happens if they do not.",
+        "risk_reason": risk_reason,
+        "suggestions": [
+            "Use clear, simple wording so each side understands its duties.",
+            "Make sure dates, responsibilities, and limits are written clearly.",
+            "Review the final wording carefully before signing.",
+        ],
+        "complexity_level": "High" if level == "high" else "Medium" if level == "medium" else "Low",
+    }
+
+
 def classify_risk(text: str) -> str:
     prompt = f"""
-    You are a legal AI assistant.
-    Analyze the following contract and for each key clause:
-    1. Assign a risk level (Low, Medium, High)
-    2. Return only the risk levels in bullet points.
+    You are a legal AI assistant helping a non-lawyer understand a contract.
+    Analyze the following contract and list the main clauses in bullet points.
+    For each bullet:
+    1. Name the clause in simple words
+    2. Assign a risk level (Low, Medium, High)
+    3. Add one short plain-English sentence that says why it matters or what to watch out for
+
+    Keep the wording simple, direct, and easy for a student to understand.
+    Do not mention software, code, APIs, files, or system details.
 
     Contract Text:
     {text}
@@ -241,11 +310,16 @@ def classify_risk(text: str) -> str:
 
 def suggest_improvements(text: str) -> str:
     prompt = f"""
-    You are a legal AI assistant.
-    Analyze the following contract and suggest **improvements** to reduce risks:
-    - Rewrite unclear clauses
-    - Recommend missing protections
-    - Keep recommendations concise in bullet points
+    You are a legal AI assistant helping a non-lawyer understand a contract.
+    Analyze the following contract and suggest improvements that reduce risk.
+
+    For each bullet point:
+    - explain the improvement in plain, easy English
+    - make clear what problem it solves
+    - keep it short and practical
+
+    Focus only on the contract terms, obligations, risks, and protections.
+    Do not mention software, code, APIs, files, or system details.
 
     Contract Text:
     {text}
@@ -322,12 +396,34 @@ def _normalize_analysis_payload(payload: dict) -> dict:
 
 def _analysis_storage_payload(payload: dict) -> dict:
     normalized = _normalize_analysis_payload(payload if isinstance(payload, dict) else {})
-    return {
+    stored = {
         "risk_score": normalized["risk_score"],
         "risk_level": normalized["risk_level"],
         "summary": normalized["summary"],
         "clauses": normalized["clauses"],
     }
+    if isinstance(payload, dict):
+        text_hash = str(payload.get("text_hash") or "").strip()
+        if text_hash:
+            stored["text_hash"] = text_hash
+    return stored
+
+
+def _contract_text_hash(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _has_meaningful_analysis(payload: dict | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    summary = str(payload.get("summary") or "").strip()
+    clauses = payload.get("clauses")
+    risk_score = payload.get("risk_score")
+    return (
+        bool(summary)
+        or (isinstance(clauses, list) and len(clauses) > 0)
+        or isinstance(risk_score, (int, float))
+    )
 
 
 def _resolve_utf8_font_name() -> str:
@@ -435,6 +531,48 @@ def _generate_simple_report_pdf(title: str, lines: list[str]) -> bytes:
 
 Base.metadata.create_all(bind=engine)
 
+
+def _ensure_contract_owner_column() -> None:
+    """
+    Minimal in-app migration to keep existing DBs working.
+
+    The project uses `create_all()` which won't add new columns to an existing table,
+    so we ensure `contracts.owner_id` exists for user-level data isolation.
+    """
+
+    inspector = inspect(engine)
+    schema_attempts = (None, "public")
+
+    columns: set[str] = set()
+    schema_used: str | None = None
+    for schema in schema_attempts:
+        try:
+            cols = inspector.get_columns("contracts", schema=schema)
+            columns = {c.get("name") for c in cols if c.get("name")}
+            schema_used = schema
+            break
+        except Exception:
+            continue
+
+    if not columns or "owner_id" in columns:
+        return
+
+    alter_targets = ["contracts"] if not schema_used else [f"{schema_used}.contracts", "contracts"]
+    with engine.begin() as conn:
+        for target in alter_targets:
+            try:
+                conn.execute(text(f"ALTER TABLE {target} ADD COLUMN owner_id VARCHAR"))
+                break
+            except Exception:
+                continue
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_contracts_owner_id ON contracts (owner_id)"))
+        except Exception:
+            pass
+
+
+_ensure_contract_owner_column()
+
 UPLOAD_FOLDER = "uploads"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -453,8 +591,17 @@ def root():
 
 def generate_contract_summary(text: str) -> str:
     prompt = f"""
-    You are a legal assistant AI.
-    Summarize the following contract clearly and concisely in bullet points:
+    You are a legal assistant helping a non-lawyer understand a contract.
+    Summarize the following contract in simple, plain English.
+
+    Make the summary easy for a student to understand.
+    Explain:
+    - what the contract is mainly about
+    - the most important duties or promises
+    - what the reader should be careful about
+
+    Keep the legal meaning accurate, but avoid legal jargon when possible.
+    Do not mention software, code, APIs, files, or system details.
 
     {text}
     """
@@ -507,7 +654,7 @@ def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db),curr
     embeddings_np = _safe_embed_contents(chunks, task_type="RETRIEVAL_DOCUMENT")
     if embeddings_np is not None and len(embeddings_np) > 0:
         vector_to_metadata.extend(
-            {"contract_id": contract_id, "chunk_text": chunk}
+            {"contract_id": contract_id, "owner_id": current_user.id, "chunk_text": chunk}
             for chunk in chunks
         )
         index.add(embeddings_np)
@@ -531,6 +678,7 @@ def upload_file(file: UploadFile = File(...), db: Session = Depends(get_db),curr
     # Save record in database
     new_contract = Contract(
     id=contract_id,
+    owner_id=current_user.id,
     filename=file.filename,
     file_path=file_location,
     summary=ai_summary,
@@ -564,10 +712,21 @@ class QueryV2Request(BaseModel):
     top_k: int = 3
     conversation_id: str | None = None
     stream: bool = False
+
+
+class ChatMessageCreateRequest(BaseModel):
+    role: str
+    content: str
 from auth_utils import get_current_user
 
 
-def _search_relevant_chunks(user_query: str, top_k: int, contract_id: str | None = None):
+def _search_relevant_chunks(
+    user_query: str,
+    top_k: int,
+    *,
+    owner_id: str | None = None,
+    contract_id: str | None = None,
+):
     embedding = _safe_embed_contents([user_query], task_type="RETRIEVAL_DOCUMENT")
     if embedding is None or len(embedding) == 0:
         return []
@@ -581,6 +740,8 @@ def _search_relevant_chunks(user_query: str, top_k: int, contract_id: str | None
             continue
 
         metadata = vector_to_metadata[idx]
+        if owner_id and metadata.get("owner_id") != owner_id:
+            continue
         if contract_id and metadata.get("contract_id") != contract_id:
             continue
 
@@ -634,37 +795,79 @@ def _simple_search_chunks(text: str, user_query: str, contract_id: str | None, t
     return results
 
 
+def _load_recent_chat_history(
+    db: Session,
+    contract_id: str,
+    user_id: str,
+    *,
+    limit: int = 5,
+) -> list[ChatMessage]:
+    recent = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.contract_id == contract_id, ChatMessage.user_id == user_id)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(recent))
+
+
+def _format_chat_history_lines(history: list[ChatMessage] | list[dict] | None) -> list[str]:
+    lines: list[str] = []
+    for turn in history or []:
+        role = ""
+        content = ""
+        if isinstance(turn, ChatMessage):
+            role = str(turn.role or "").strip().lower()
+            content = str(turn.content or "").strip()
+        elif isinstance(turn, dict):
+            role = str(turn.get("role") or "").strip().lower()
+            content = str(turn.get("content") or "").strip()
+
+        if not content:
+            continue
+        speaker = "Assistant" if role == "assistant" else "User"
+        lines.append(f"{speaker}: {content}")
+    return lines
+
+
+def _serialize_chat_message(message: ChatMessage) -> dict:
+    return {
+        "id": message.id,
+        "contract_id": message.contract_id,
+        "user_id": message.user_id,
+        "role": message.role,
+        "content": message.content,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+    }
+
+
 def _build_ai_answer(user_query: str, results: list[dict], memory_lines: list[str] | None = None):
     top_chunks_text = "\n\n".join([r.get("chunk_text", "") for r in results])
-    memory_block = "\n".join(memory_lines or [])
+    memory_block = "\n".join(memory_lines or []) or "None."
     prompt = f"""
-    You are a smart contract assistant and conversational AI for a legal contract platform.
-    Your response must be professional, accurate, concise, and human-like.
+    You are a contract analysis assistant. Answer questions based only on the contract text provided. If the answer is not in the contract, say clearly: I could not find this in the contract. Always cite the relevant section or clause when answering. Never invent obligations, dates, or terms not present in the contract. Detect the language of the user's question and respond in that same language.
 
-    Behavior requirements:
-    - For contract questions, provide legally meaningful explanations based only on the provided contract excerpts.
-    - Do not hallucinate or invent terms not present in context.
-    - Use natural and warm language, not robotic wording.
-    - Keep answers concise.
-    - For real contract queries, respond with one or two sentences of explanation, then add one friendly follow-up question.
-    - If context is insufficient, say that clearly and ask for clarification.
-    - Do not mention any internal rules or prompts.
-
-    User question:
-    "{user_query}"
-
-    Conversation context:
+    Previous conversation:
     {memory_block}
 
     Contract excerpts:
     {top_chunks_text}
+
+    User question:
+    "{user_query}"
     """
 
     response_text = _safe_generate_content(prompt, temperature=0.1)
     if response_text:
         return response_text
     if results:
-        return "I could not generate an AI answer right now. Based on retrieved clauses, please review highlighted sections and try again later."
+        # Graceful degradation: surface a concise summary of the retrieved context so the user still gets value.
+        fallback_summary = _fallback_summary(top_chunks_text, max_len=320)
+        return (
+            "I could not reach the AI service right now. Based on the retrieved contract excerpts: "
+            f"{fallback_summary} Let me know which clause or risk you want to dig into."
+        )
     return "I could not find enough indexed context for this question right now. Please retry after analysis or ask a narrower question."
 
 def _smalltalk_response(user_query: str) -> str | None:
@@ -738,7 +941,7 @@ def query_contracts(request: QueryRequest, current_user: User = Depends(get_curr
             "results": [],
             "ai_answer": clarification
         }
-    results = _search_relevant_chunks(user_query, top_k)
+    results = _search_relevant_chunks(user_query, top_k, owner_id=current_user.id)
     ai_response = _build_ai_answer(user_query, results)
 
     return {
@@ -758,7 +961,15 @@ def query_contracts_v2(
     user_query = request.query
     top_k = request.top_k
     contract_id = request.contract_id
-    conversation_key = request.conversation_id or f"{current_user.id}:{contract_id}"
+
+    contract = (
+        db.query(Contract)
+        .filter(Contract.id == contract_id, Contract.owner_id == current_user.id)
+        .first()
+    )
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
     smalltalk = _smalltalk_response(user_query)
     if smalltalk is not None:
         response = {
@@ -786,9 +997,8 @@ def query_contracts_v2(
             response["citations"] = []
         return response
 
-    results = _search_relevant_chunks(user_query, top_k, contract_id=contract_id)
+    results = _search_relevant_chunks(user_query, top_k, owner_id=current_user.id, contract_id=contract_id)
     if not results:
-        contract = db.query(Contract).filter(Contract.id == contract_id).first()
         results = _simple_search_chunks(
             contract.text if contract else "",
             user_query,
@@ -796,23 +1006,14 @@ def query_contracts_v2(
             top_k,
         )
 
-    memory_lines = []
-    if ENABLE_CHAT_MEMORY:
-        history = CHAT_MEMORY.get(conversation_key, [])[-8:]
-        for turn in history:
-            memory_lines.append(f"{turn.get('role', 'user')}: {turn.get('content', '')}")
+    recent_history = _load_recent_chat_history(db, contract_id, current_user.id, limit=5)
+    memory_lines = _format_chat_history_lines(recent_history)
 
     ai_response = _build_ai_answer(
         user_query,
         results,
-        memory_lines if ENABLE_CHAT_MEMORY else None,
+        memory_lines,
     )
-
-    if ENABLE_CHAT_MEMORY:
-        CHAT_MEMORY.setdefault(conversation_key, []).extend(
-            [{"role": "user", "content": user_query}, {"role": "assistant", "content": ai_response or ""}]
-        )
-        CHAT_MEMORY[conversation_key] = CHAT_MEMORY[conversation_key][-20:]
 
     response = {
         "query": user_query,
@@ -837,9 +1038,67 @@ def query_contracts_v2(
     return response
 
 
+@app.get("/chat/{contract_id}/messages")
+def get_chat_messages(
+    contract_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    contract = (
+        db.query(Contract)
+        .filter(Contract.id == contract_id, Contract.owner_id == current_user.id)
+        .first()
+    )
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.contract_id == contract_id, ChatMessage.user_id == current_user.id)
+        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+        .all()
+    )
+    return {"messages": [_serialize_chat_message(message) for message in messages]}
+
+
+@app.post("/chat/{contract_id}/messages")
+def create_chat_message(
+    contract_id: str,
+    payload: ChatMessageCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    contract = (
+        db.query(Contract)
+        .filter(Contract.id == contract_id, Contract.owner_id == current_user.id)
+        .first()
+    )
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    role = str(payload.role or "").strip().lower()
+    content = str(payload.content or "").strip()
+    if role not in {"user", "assistant"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    if not content:
+        raise HTTPException(status_code=400, detail="Content is required")
+
+    message = ChatMessage(
+        contract_id=contract_id,
+        user_id=current_user.id,
+        role=role,
+        content=content,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+
+    return _serialize_chat_message(message)
+
+
 @app.get("/contracts")
 def get_contracts(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    contracts = db.query(Contract).all()
+    contracts = db.query(Contract).filter(Contract.owner_id == current_user.id).all()
     
     return [
         {
@@ -856,7 +1115,7 @@ def get_contracts(db: Session = Depends(get_db), current_user: User = Depends(ge
 @app.get("/contract/{contract_id}")
 @app.get("/contracts/{contract_id}")
 def get_contract(contract_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    c = db.query(Contract).filter(Contract.id == contract_id).first()
+    c = db.query(Contract).filter(Contract.id == contract_id, Contract.owner_id == current_user.id).first()
     
     if not c:
         return {"error": "Contract not found"}
@@ -874,11 +1133,14 @@ def get_contract(contract_id: str, db: Session = Depends(get_db), current_user: 
 
 @app.post("/contracts/{contract_id}/analyze")
 def analyze_contract(contract_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    contract = db.query(Contract).filter(Contract.id == contract_id).first()
+    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.owner_id == current_user.id).first()
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
     contract_text = (contract.text or "").strip()
+    current_text_hash = _contract_text_hash(contract_text)
+    stored_analysis = contract.analysis if isinstance(contract.analysis, dict) else {}
+
     if not contract_text:
         fallback_summary = str(contract.summary or "").strip()
         normalized = _normalize_analysis_payload(
@@ -901,6 +1163,10 @@ def analyze_contract(contract_id: str, db: Session = Depends(get_db), current_us
             "chunks": [],
         }
 
+    stored_text_hash = str(stored_analysis.get("text_hash") or "").strip()
+    if _has_meaningful_analysis(stored_analysis) and stored_text_hash == current_text_hash:
+        return _normalize_analysis_payload(stored_analysis)
+
     prompt = f"""
 You are a legal contract risk analyzer.
 Return ONLY valid JSON. No markdown, no explanations, no extra text.
@@ -914,16 +1180,27 @@ Schema:
     {{
       "type": "<clause category>",
       "risk_level": "low" | "medium" | "high",
-      "text": "<original or paraphrased clause text>"
+      "text": "<quoted clause text from the contract>"
     }}
   ]
 }}
+
+Rules:
+- Be deterministic and conservative.
+- Use the same scoring standard every time for the same text.
+- Keep clause order aligned to the contract order.
+- Return at most 8 clauses.
+- Do not invent clauses that are not present in the contract.
+- Write the summary in simple, plain English for a non-lawyer.
+- The summary should briefly explain what the contract means, why it matters, and what to be careful about.
+- Focus only on contract meaning, obligations, and risks.
+- Do not mention software, code, APIs, files, or system details.
 
 Contract text:
 {contract_text[:12000]}
 """
 
-    raw_text = _safe_generate_content(prompt, temperature=0.1)
+    raw_text = _safe_generate_content(prompt, temperature=0.0)
 
     payload = _extract_json_object(raw_text)
     if payload:
@@ -936,6 +1213,7 @@ Contract text:
         normalized["layman_summary"] = normalized["summary"]
         normalized["answer"] = normalized["summary"]
 
+    normalized["text_hash"] = current_text_hash
     contract.analysis = _analysis_storage_payload(normalized)
     db.commit()
 
@@ -944,7 +1222,7 @@ Contract text:
 
 @app.get("/report/{contract_id}")
 def download_contract_report(contract_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    contract = db.query(Contract).filter(Contract.id == contract_id).first()
+    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.owner_id == current_user.id).first()
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
@@ -980,10 +1258,11 @@ def download_contract_report(contract_id: str, db: Session = Depends(get_db), cu
 
 @app.delete("/contracts/{contract_id}")
 def delete_contract(contract_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    contract = db.query(Contract).filter(Contract.id == contract_id).first()
+    contract = db.query(Contract).filter(Contract.id == contract_id, Contract.owner_id == current_user.id).first()
     if not contract:
         return {"error": "Contract not found"}
 
+    db.query(ChatMessage).filter(ChatMessage.contract_id == contract_id).delete(synchronize_session=False)
     db.delete(contract)
     db.commit()
     return {"message": "Contract deleted"}
@@ -992,7 +1271,7 @@ def delete_contract(contract_id: str, db: Session = Depends(get_db), current_use
 async def explain_clause(data: ClauseExplainRequest):
 
     prompt = f"""
-    You are a legal AI assistant.
+    You are a legal AI assistant helping a non-lawyer understand a contract clause.
 
     Analyze this contract clause:
 
@@ -1014,6 +1293,14 @@ async def explain_clause(data: ClauseExplainRequest):
         "complexity_level": "Low/Medium/High"
     }}
 
+    Rules:
+    - Use plain, easy English.
+    - Explain what the clause means in everyday words.
+    - Explain why it matters and what the reader should be careful about.
+    - Keep the legal meaning accurate.
+    - Focus only on the contract language.
+    - Do not mention software, code, APIs, files, or system details.
+
     Do not include anything outside JSON.
     """
 
@@ -1021,35 +1308,16 @@ async def explain_clause(data: ClauseExplainRequest):
     parsed = _extract_json_object(raw_text)
 
     if not parsed:
-        simple = _fallback_summary(data.clause_text, max_len=260)
-        level = str(data.risk_level or "medium").strip().lower()
-        risk_reason = (
-            "This clause may expose one side to high obligations or weak safeguards."
-            if level == "high"
-            else "This clause has moderate ambiguity or obligations that should be clarified."
-            if level == "medium"
-            else "This clause appears lower risk but should still be reviewed for clarity."
-        )
-        return {
-            "simple_explanation": simple or "Could not parse structured explanation.",
-            "example": f"For example, define exact duties and timelines for {data.clause_type or 'this clause'}.",
-            "risk_reason": risk_reason,
-            "suggestions": [
-                "Define obligations and timelines in explicit language.",
-                "Add limits, exceptions, and dispute handling terms.",
-                "Review manually with legal counsel for final wording.",
-            ],
-            "complexity_level": "High" if level == "high" else "Medium"
-        }
+        return _fallback_clause_explanation(data.clause_text, data.clause_type, data.risk_level)
 
     suggestions_raw = parsed.get("suggestions")
-    suggestions = suggestions_raw if isinstance(suggestions_raw, list) else ["Review manually."]
-    suggestions = [str(item).strip() for item in suggestions if str(item).strip()] or ["Review manually."]
+    suggestions = suggestions_raw if isinstance(suggestions_raw, list) else ["Review the wording carefully before signing."]
+    suggestions = [str(item).strip() for item in suggestions if str(item).strip()] or ["Review the wording carefully before signing."]
 
     return {
-        "simple_explanation": str(parsed.get("simple_explanation") or "").strip() or raw_text.strip() or "No explanation provided.",
+        "simple_explanation": str(parsed.get("simple_explanation") or "").strip() or raw_text.strip() or "No simple explanation was provided.",
         "example": str(parsed.get("example") or "").strip() or "No example provided.",
-        "risk_reason": str(parsed.get("risk_reason") or "").strip() or "No risk reason provided.",
+        "risk_reason": str(parsed.get("risk_reason") or "").strip() or "No risk reason was provided.",
         "suggestions": suggestions,
         "complexity_level": str(parsed.get("complexity_level") or "Medium").strip() or "Medium",
     }

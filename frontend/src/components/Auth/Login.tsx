@@ -33,6 +33,7 @@ export default function Login() {
     setLoading(true);
     try {
       const data = await loginUser(email.trim(), password);
+      localStorage.setItem("auth_username", email.trim());
       login(data.access_token);
       navigate("/dashboard");
     } catch (err: unknown) {

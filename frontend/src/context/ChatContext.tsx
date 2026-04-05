@@ -10,6 +10,7 @@ interface ChatContextValue extends ChatState {
   addMessage: (contractId: string, message: RagMessage) => void;
   clearHistory: (contractId: string) => void;
   getMessages: (contractId: string) => RagMessage[];
+  setMessages: (contractId: string, messages: RagMessage[]) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -21,6 +22,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setHistory((prev) => ({
       ...prev,
       [contractId]: [...(prev[contractId] || []), message],
+    }));
+  }, []);
+
+  const setMessages = useCallback((contractId: string, messages: RagMessage[]) => {
+    setHistory((prev) => ({
+      ...prev,
+      [contractId]: messages,
     }));
   }, []);
 
@@ -38,7 +46,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <ChatContext.Provider value={{ history, addMessage, clearHistory, getMessages }}>
+    <ChatContext.Provider value={{ history, addMessage, clearHistory, getMessages, setMessages }}>
       {children}
     </ChatContext.Provider>
   );

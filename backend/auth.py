@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from database import get_db
 from models import User
-from auth_utils import get_password_hash, verify_password, create_access_token
+from auth_utils import get_password_hash, verify_password, create_access_token, get_current_user
 from pydantic import BaseModel
 import os
 
@@ -51,3 +51,11 @@ def login(login_data: LoginRequest, db: Session = Depends(get_db)):
     token = create_access_token(user.id)
 
     return {"access_token": token, "token_type": "bearer"}
+
+
+@router.get("/me")
+def me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+    }

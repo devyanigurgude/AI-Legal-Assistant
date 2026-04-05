@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { User } from "@/types/api";
+import { getMe } from "@/services/apiService";
 
 interface AuthContextValue {
   user: User | null;
@@ -19,10 +20,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const parseUserFromToken = useCallback((jwt: string): User | null => {
     try {
       const payload = JSON.parse(atob(jwt.split(".")[1] || ""));
-      return {
-        name: payload.name || payload.username,
-        email: payload.email || payload.username,
-      };
+      const displayFromToken: string | undefined =
+        payload.name || payload.username || payload.email || payload.preferred_username || payload.sub;
+
+      const rememberedUsername = localStorage.getItem("auth_username") || undefined;
+
+      if (displayFromToken) {
+        return {
+          name: displayFromToken,
+          email: payload.email || payload.username || rememberedUsername || displayFromToken,
+        };
+      }
+
+      if (rememberedUsername) {
+        return { name: rememberedUsername, email: rememberedUsername };
+      }
+
+      if (payload.user_id) {
+        return { name: `ID: ${payload.user_id}`, email: "" };
+      }
+
+      return null;
     } catch {
       return null;
     }
@@ -47,8 +65,41 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setIsLoading(false);
       return;
     }
-    setUser(parseUserFromToken(token));
-    setIsLoading(false);
+
+    let cancelled = false;
+    setIsLoading(true);
+
+    getMe()
+      .then((data: unknown) => {
+        if (cancelled) return;
+        const record = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+        const username = typeof record.username === "string" ? record.username : "";
+        const id = typeof record.id === "string" ? record.id : "";
+
+        if (username) {
+          setUser({ name: username, email: username });
+          return;
+        }
+
+        if (id) {
+          setUser({ name: `ID: ${id}`, email: "" });
+          return;
+        }
+
+        setUser(parseUserFromToken(token));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setUser(parseUserFromToken(token));
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setIsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [token, parseUserFromToken]);
 
   return (

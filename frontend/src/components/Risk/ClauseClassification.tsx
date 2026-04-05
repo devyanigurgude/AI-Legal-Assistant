@@ -1,6 +1,7 @@
 import React from "react";
 import { explainClause } from "@/services/api";
 import type { Clause, ClauseExplanationResponse } from "@/types/api";
+import { formatClauseDisplayText } from "@/lib/clauseText";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -22,6 +23,15 @@ const riskBadge = {
   medium: "risk-badge-medium",
   low: "risk-badge-low",
 };
+
+function normalizeDisplayText(text: string | null | undefined) {
+  return String(text ?? "")
+    .replace(/ﬁ/g, "fi")
+    .replace(/ﬂ/g, "fl")
+    .replace(/\r\n/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 export default function ClauseClassification({ clauses }: Props) {
   const safeClauses = Array.isArray(clauses) ? clauses : [];
@@ -131,7 +141,9 @@ export default function ClauseClassification({ clauses }: Props) {
                       Explain
                     </Button>
                   </div>
-                  <p className="text-sm text-foreground/85 leading-relaxed">{clause?.text ?? "No clause text available"}</p>
+                  <p className="text-sm text-foreground/85 leading-relaxed break-words">
+                    {formatClauseDisplayText(clause?.text) || "No clause text available"}
+                  </p>
                 </div>
               ))}
             </div>
@@ -170,15 +182,15 @@ export default function ClauseClassification({ clauses }: Props) {
 
               <section className="space-y-1">
                 <h4 className="text-sm font-semibold">Simple Explanation</h4>
-                <p className="text-sm text-foreground/85 leading-relaxed">
-                  {explanation.simple_explanation || "No explanation available."}
+                <p className="text-sm text-foreground/85 leading-relaxed break-words">
+                  {formatClauseDisplayText(explanation.simple_explanation) || "No explanation available."}
                 </p>
               </section>
 
               <section className="space-y-1">
                 <h4 className="text-sm font-semibold">Example</h4>
-                <p className="text-sm text-foreground/85 leading-relaxed">
-                  {explanation.example || "No example available."}
+                <p className="text-sm text-foreground/85 leading-relaxed break-words">
+                  {formatClauseDisplayText(explanation.example) || "No example available."}
                 </p>
               </section>
 
@@ -190,8 +202,8 @@ export default function ClauseClassification({ clauses }: Props) {
                 }`}
               >
                 <h4 className="text-sm font-semibold">Risk Reason</h4>
-                <p className="text-sm text-foreground/85 leading-relaxed">
-                  {explanation.risk_reason || "No risk reason available."}
+                <p className="text-sm text-foreground/85 leading-relaxed break-words">
+                  {formatClauseDisplayText(explanation.risk_reason) || "No risk reason available."}
                 </p>
               </section>
 
@@ -200,7 +212,9 @@ export default function ClauseClassification({ clauses }: Props) {
                 {Array.isArray(explanation.suggestions) && explanation.suggestions.length > 0 ? (
                   <ul className="list-disc pl-5 space-y-1 text-sm text-foreground/85">
                     {explanation.suggestions.map((suggestion, index) => (
-                      <li key={`${selectedClause?.id || "clause"}-suggestion-${index}`}>{suggestion}</li>
+                      <li key={`${selectedClause?.id || "clause"}-suggestion-${index}`} className="break-words">
+                        {formatClauseDisplayText(suggestion)}
+                      </li>
                     ))}
                   </ul>
                 ) : (

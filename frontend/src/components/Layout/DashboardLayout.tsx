@@ -1,5 +1,5 @@
 import React from "react";
-import { Outlet, useNavigate, useLocation } from "react-router-dom";
+import { Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import {
   SidebarProvider,
@@ -16,10 +16,11 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { NavLink } from "@/components/NavLink";
-import { Scale, FileText, Shield, MessageSquare, BarChart3, LogOut, LayoutDashboard } from "lucide-react";
+import { Scale, FileText, Shield, MessageSquare, BarChart3, LogOut, LayoutDashboard, Home, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 const navItems = [
+  { title: "Home", url: "/", icon: Home },
   { title: "Overview", url: "/dashboard", icon: LayoutDashboard },
   { title: "Contracts", url: "/dashboard/contracts", icon: FileText },
   { title: "Risk Analysis", url: "/dashboard/analysis", icon: Shield },
@@ -35,7 +36,7 @@ function AppSidebar() {
 
   const handleLogout = () => {
     logout();
-    navigate("/login");
+    navigate("/");
   };
 
   return (
@@ -54,7 +55,12 @@ function AppSidebar() {
               {navItems.map((item) => (
                 <SidebarMenuItem key={item.title}>
                   <SidebarMenuButton asChild>
-                    <NavLink to={item.url} end={item.url === "/dashboard"} className="hover:bg-sidebar-accent/50" activeClassName="bg-sidebar-accent text-sidebar-primary font-medium">
+                    <NavLink
+                      to={item.url}
+                      end={item.url === "/dashboard" || item.url === "/"}
+                      className="hover:bg-sidebar-accent/50"
+                      activeClassName="bg-sidebar-accent text-sidebar-primary font-medium"
+                    >
                       <item.icon className="mr-2 h-4 w-4" />
                       {!collapsed && <span>{item.title}</span>}
                     </NavLink>
@@ -83,6 +89,8 @@ function AppSidebar() {
 }
 
 export default function DashboardLayout() {
+  const { user } = useAuth();
+
   return (
     <SidebarProvider>
       <div className="min-h-screen flex w-full">
@@ -92,6 +100,15 @@ export default function DashboardLayout() {
           <header className="h-14 flex items-center border-b bg-card px-4 gap-3">
             <SidebarTrigger />
             <div className="flex-1" />
+            {user ? (
+              <div className="hidden items-center gap-2 rounded-lg border bg-background/70 px-3 py-1.5 shadow-card backdrop-blur sm:flex">
+                <User className="h-4 w-4 text-primary" />
+                <div className="leading-tight">
+                  <div className="text-[11px] text-muted-foreground">Signed in as</div>
+                  <div className="text-sm font-medium text-foreground">{user.name || user.email}</div>
+                </div>
+              </div>
+            ) : null}
           </header>
 
           {/* Content */}

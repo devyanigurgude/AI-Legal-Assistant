@@ -96,12 +96,12 @@ export default function ContractDetails({ contractId }: Props) {
         <h2 className="font-display text-xl">Contract Analysis</h2>
         <Button type="button" variant="outline" size="sm" onClick={handleAnalyze} disabled={analyzing}>
           {analyzing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-          Re-analyze
+          Refresh saved analysis
         </Button>
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
-
+    
       <RiskSummary score={analysis.risk_score} level={analysis.risk_level} />
       <LaymanSummary summary={analysis.layman_summary} />
       <ClauseClassification clauses={analysis.clauses} />

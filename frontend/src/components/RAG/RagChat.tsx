@@ -1,63 +1,64 @@
 import React, { useState, useRef, useEffect } from "react";
-import { analyzeContract } from "@/services/apiService";
+import { analyzeContract, getChatMessages, saveChatMessage } from "@/services/apiService";
 import { useChat } from "@/context/ChatContext";
-import type { RagMessage, RagChunk } from "@/types/api";
+import type { RagMessage } from "@/types/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { MessageSquare, Send, Trash2, ChevronDown } from "lucide-react";
+import { MessageSquare, Send, Trash2 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 interface Props {
   contractId: string;
 }
 
-function ChunkList({ chunks }: { chunks?: RagChunk[] | null }) {
-  const [open, setOpen] = useState(false);
-  const safeChunks = Array.isArray(chunks) ? chunks : [];
-  if (!safeChunks.length) return null;
-
-  return (
-    <div className="mt-2">
-      <button onClick={() => setOpen(!open)} className="text-xs text-accent flex items-center gap-1 hover:underline">
-        <ChevronDown className={`h-3 w-3 transition-transform ${open ? "rotate-180" : ""}`} />
-        {safeChunks.length} source chunk{safeChunks.length > 1 ? "s" : ""}
-      </button>
-      {open && (
-        <div className="mt-2 space-y-1">
-          {safeChunks.map((c, i) => (
-            <div key={i} className="text-xs bg-secondary/50 p-2 rounded border border-border">
-              <span className="text-muted-foreground">
-                Score: {typeof c?.score === "number" ? c.score.toFixed(3) : "0.000"}
-                {c?.page ? ` | Page ${c.page}` : ""}
-              </span>
-              <p className="mt-1 text-foreground/80">{(c?.text ?? "").slice(0, 200)}...</p>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function RagChat({ contractId }: Props) {
-  const { getMessages, addMessage, clearHistory } = useChat();
+  const { getMessages, addMessage, clearHistory, setMessages } = useChat();
   const messages = getMessages(contractId);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadHistory = async () => {
+      setHistoryLoading(true);
+      try {
+        const history = await getChatMessages(contractId);
+        if (cancelled) return;
+        setMessages(contractId, history);
+      } catch {
+        if (cancelled) return;
+        setMessages(contractId, []);
+      } finally {
+        if (cancelled) return;
+        setHistoryLoading(false);
+      }
+    };
+
+    void loadHistory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contractId, setMessages]);
+
   const handleSend = async () => {
     const q = query.trim();
-    if (!q || loading) return;
+    if (!q || loading || historyLoading) return;
     setQuery("");
 
     const userMsg: RagMessage = { role: "user", content: q, timestamp: new Date().toISOString() };
     addMessage(contractId, userMsg);
+    try {
+      await saveChatMessage(contractId, { role: "user", content: q });
+    } catch {}
 
     setLoading(true);
     try {
@@ -65,10 +66,15 @@ export default function RagChat({ contractId }: Props) {
       const assistantMsg: RagMessage = {
         role: "assistant",
         content: typeof res?.ai_answer === "string" ? res.ai_answer : "No answer returned.",
-        chunks: Array.isArray(res?.results) ? res.results : [],
         timestamp: new Date().toISOString(),
       };
       addMessage(contractId, assistantMsg);
+      try {
+        await saveChatMessage(contractId, {
+          role: "assistant",
+          content: assistantMsg.content,
+        });
+      } catch {}
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to get response";
       const errMsg: RagMessage = {
@@ -107,8 +113,12 @@ export default function RagChat({ contractId }: Props) {
             <div className="flex items-center justify-center h-full py-16 text-center">
               <div>
                 <MessageSquare className="h-10 w-10 text-muted-foreground/40 mx-auto mb-3" />
-                <p className="text-muted-foreground text-sm">Ask questions about your contract</p>
-                <p className="text-xs text-muted-foreground/60 mt-1">e.g. "What are the termination clauses?"</p>
+                <p className="text-muted-foreground text-sm">
+                  {historyLoading ? "Loading chat history..." : "Ask questions about your contract"}
+                </p>
+                {!historyLoading && (
+                  <p className="text-xs text-muted-foreground/60 mt-1">e.g. "What are the termination clauses?"</p>
+                )}
               </div>
             </div>
           ) : (
@@ -121,7 +131,6 @@ export default function RagChat({ contractId }: Props) {
                     }`}
                   >
                     <p className="whitespace-pre-wrap">{msg.content}</p>
-                    {msg.chunks && <ChunkList chunks={msg.chunks} />}
                   </div>
                 </div>
               ))}
@@ -150,10 +159,10 @@ export default function RagChat({ contractId }: Props) {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Ask about this contract..."
-            disabled={loading}
+            disabled={loading || historyLoading}
             className="flex-1"
           />
-          <Button type="submit" size="icon" disabled={!query.trim() || loading}>
+          <Button type="submit" size="icon" disabled={!query.trim() || loading || historyLoading}>
             <Send className="h-4 w-4" />
           </Button>
         </form>
